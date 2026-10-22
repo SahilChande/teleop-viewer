@@ -27,20 +27,46 @@
   <script>
     const status = document.querySelector('#status');
     const grid = document.querySelector('#grid');
-    // url + token come in the #fragment (never sent to the page's server). They
-    // are kept in sessionStorage so a reload of the same tab (F5, a big screen
-    // that refreshes) reconnects instead of losing the link.
+    // Long link: url + token come in the #fragment (never sent to the page's
+    // server). They are kept in sessionStorage so a reload of the same tab (F5,
+    // a big screen that refreshes) reconnects instead of losing the link.
+    // Short link: #k=<code>, resolved by resolveShortLink() below; it stays in
+    // the address bar and is resolved again on every reload.
     const params = new URLSearchParams(location.hash.slice(1));
+    const shortCode = params.get('k');
     let url = params.get('url');
     let token = params.get('token');
-    try {
-      if (url && token) {
-        sessionStorage.setItem('teleopViewer', JSON.stringify({ url, token }));
-      } else {
-        ({ url, token } = JSON.parse(sessionStorage.getItem('teleopViewer')) || {});
-      }
-    } catch (_) {}
-    try { history.replaceState(null, '', location.href.split('#')[0]); } catch (_) {}
+    if (!shortCode) {
+      try {
+        if (url && token) {
+          sessionStorage.setItem('teleopViewer', JSON.stringify({ url, token }));
+        } else {
+          ({ url, token } = JSON.parse(sessionStorage.getItem('teleopViewer')) || {});
+        }
+      } catch (_) {}
+      try { history.replaceState(null, '', location.href.split('#')[0]); } catch (_) {}
+    }
+
+    // links/<first 32 hex of sha256(code)>.json next to this page holds
+    // {salt, iv, iterations, data}: AES-GCM (key = PBKDF2-SHA256 of the code) of
+    // {url, token}. The code never leaves the browser; without it the public
+    // file is useless. Written by davegi_teleop_demo ./viewer_link.sh.
+    async function resolveShortLink(code) {
+      const encoder = new TextEncoder();
+      const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(code)));
+      const id = [...digest].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
+      const response = await fetch(`links/${id}.json`, { cache: 'no-store' });
+      if (response.status === 404) throw new Error('This link is unknown or was switched off.');
+      if (!response.ok) throw new TypeError(`HTTP ${response.status}`);
+      const box = await response.json();
+      const bytes = text => Uint8Array.from(atob(text), c => c.charCodeAt(0));
+      const base = await crypto.subtle.importKey('raw', encoder.encode(code), 'PBKDF2', false, ['deriveKey']);
+      const key = await crypto.subtle.deriveKey(
+        { name: 'PBKDF2', hash: 'SHA-256', salt: bytes(box.salt), iterations: box.iterations },
+        base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+      const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes(box.iv) }, key, bytes(box.data));
+      return JSON.parse(new TextDecoder().decode(plain));
+    }
 
     // With a scene camera (it films the whole robot): scene on the left half,
     // full height; the other cameras stacked on the right half. Otherwise a
@@ -178,7 +204,25 @@
         retry(`Connection failed: ${error.message}`);
       });
     }
-    start();
+    async function begin() {
+      if (shortCode) {
+        try {
+          ({ url, token } = await resolveShortLink(shortCode));
+        } catch (error) {
+          // Network trouble (fetch -> TypeError): try again; anything else is final.
+          if (error instanceof TypeError) {
+            status.textContent = 'Opening the link failed (network) -- retrying in 5 s';
+            setTimeout(begin, 5000);
+          } else {
+            status.textContent = error.message.startsWith('This link')
+              ? error.message : 'This link could not be opened (wrong or damaged code).';
+          }
+          return;
+        }
+      }
+      start();
+    }
+    begin();
   </script>
 </body>
 </html>
