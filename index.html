@@ -42,10 +42,31 @@
     } catch (_) {}
     try { history.replaceState(null, '', location.href.split('#')[0]); } catch (_) {}
 
-    // Near-square grid sized to the number of cameras: 1 -> full screen,
+    // With a scene camera (it films the whole robot): scene on the left half,
+    // full height; the other cameras stacked on the right half. Otherwise a
+    // near-square grid sized to the number of cameras: 1 -> full screen,
     // 2 -> side by side, 3-4 -> 2x2.
+    const SCENE = 'scene_camera';
+    // Fixed order on screen, whatever order the cameras join in.
+    const ORDER = ['scene_camera', 'realsense', 'left_wrist_camera', 'right_wrist_camera'];
     function layout() {
-      const n = Math.max(1, grid.children.length);
+      const cards = [...grid.children];
+      for (const card of cards) {
+        const rank = ORDER.findIndex(key => card.dataset.name.includes(key));
+        card.style.order = rank < 0 ? ORDER.length : rank;
+      }
+      const scene = cards.find(card => card.dataset.name.includes(SCENE));
+      if (scene && cards.length > 1) {
+        grid.style.gridTemplateColumns = 'repeat(2, minmax(0, 1fr))';
+        grid.style.gridTemplateRows = `repeat(${cards.length - 1}, minmax(0, 1fr))`;
+        for (const card of cards) {
+          card.style.gridColumn = card === scene ? '1' : '2';
+          card.style.gridRow = card === scene ? '1 / -1' : '';
+        }
+        return;
+      }
+      for (const card of cards) { card.style.gridColumn = ''; card.style.gridRow = ''; }
+      const n = Math.max(1, cards.length);
       const cols = Math.ceil(Math.sqrt(n));
       grid.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
       grid.style.gridTemplateRows = `repeat(${Math.ceil(n / cols)}, minmax(0, 1fr))`;
@@ -54,6 +75,7 @@
     function addCard(id, name, track) {
       const card = document.createElement('article');
       card.id = id;
+      card.dataset.name = name;
       const title = document.createElement('h2');
       title.textContent = name;
       const element = track.attach();
