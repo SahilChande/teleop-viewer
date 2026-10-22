@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Teleoperation camera viewer</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    /* Everything fits one screen: the grid takes the height left under the
+       header and each video scales inside its tile (no page scrolling). */
+    html, body { height: 100%; }
+    body { margin: 0; background: #101318; color: #f5f7fa; display: flex; flex-direction: column; overflow: hidden; }
+    header { flex: none; padding: 10px 20px; display: flex; gap: 16px; align-items: baseline; }
+    h1 { margin: 0; font-size: 20px; }
+    #status { color: #aeb8c5; }
+    #sound { font: inherit; padding: 2px 12px; border-radius: 6px; border: 1px solid #343c48; background: #1b2028; color: inherit; cursor: pointer; }
+    #grid { flex: 1; min-height: 0; display: grid; gap: 12px; padding: 0 20px 20px; }
+    article { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: #1b2028; border: 1px solid #343c48; border-radius: 10px; overflow: hidden; }
+    h2 { flex: none; margin: 0; padding: 6px 12px; font-size: 15px; }
+    video { display: block; flex: 1; min-height: 0; width: 100%; height: 100%; background: #000; object-fit: contain; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client@2.22.3/dist/livekit-client.umd.min.js"></script>
+</head>
+<body>
+  <header><h1>International teleoperation cameras</h1><span id="status">Connecting…</span><button id="sound" hidden>Turn sound on</button></header>
+  <main id="grid"></main>
+  <script>
+    const status = document.querySelector('#status');
+    const grid = document.querySelector('#grid');
+    // url + token come in the #fragment (never sent to the page's server). They
+    // are kept in sessionStorage so a reload of the same tab (F5, a big screen
+    // that refreshes) reconnects instead of losing the link.
+    const params = new URLSearchParams(location.hash.slice(1));
+    let url = params.get('url');
+    let token = params.get('token');
+    try {
+      if (url && token) {
+        sessionStorage.setItem('teleopViewer', JSON.stringify({ url, token }));
+      } else {
+        ({ url, token } = JSON.parse(sessionStorage.getItem('teleopViewer')) || {});
+      }
+    } catch (_) {}
+    try { history.replaceState(null, '', location.href.split('#')[0]); } catch (_) {}
+
+    // Near-square grid sized to the number of cameras: 1 -> full screen,
+    // 2 -> side by side, 3-4 -> 2x2.
+    function layout() {
+      const n = Math.max(1, grid.children.length);
+      const cols = Math.ceil(Math.sqrt(n));
+      grid.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
+      grid.style.gridTemplateRows = `repeat(${Math.ceil(n / cols)}, minmax(0, 1fr))`;
+    }
+
+    function addCard(id, name, track) {
+      const card = document.createElement('article');
+      card.id = id;
+      const title = document.createElement('h2');
+      title.textContent = name;
+      const element = track.attach();
+      element.autoplay = true;
+      element.playsInline = true;
+      card.append(title, element);
+      grid.append(card);
+    }
+
+    // Audio tracks (robot microphone, ./audio_bringup.sh) play through hidden
+    // elements; one viewer identity = one connection, so video and audio share this page.
+    const sound = document.querySelector('#sound');
+    let muted = false;
+    const audioElements = () => document.querySelectorAll('audio');
+    // One button: shown while a robot audio track exists; "on" needs a click first
+    // (browser autoplay rule), after that it toggles mute.
+    function refreshSound() {
+      const room = window.teleopRoom;
+      sound.hidden = !room || audioElements().length === 0;
+      const playing = room && room.canPlaybackAudio && !muted;
+      sound.textContent = playing ? 'Turn sound off' : 'Turn sound on';
+      audioElements().forEach(element => { element.muted = muted; });
+    }
+    sound.onclick = async () => {
+      const room = window.teleopRoom;
+      if (room.canPlaybackAudio && !muted) muted = true;
+      else { muted = false; await room.startAudio(); }
+      refreshSound();
+    };
+
+    function showTrack(track, publication, participant) {
+      if (track.kind === 'audio') {
+        const element = track.attach();
+        element.id = `${publication.trackSid}-audio`;
+        document.body.append(element);
+        refreshSound();
+        return;
+      }
+      if (track.kind !== 'video' || document.getElementById(publication.trackSid)) return;
+      const name = publication.trackName || `${participant.identity} video`;
+      addCard(publication.trackSid, name, track);
+      layout();
+    }
+
+    async function connect() {
+      const room = new LivekitClient.Room({ adaptiveStream: false, dynacast: false });
+      room.on(LivekitClient.RoomEvent.TrackSubscribed, showTrack);
+      room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (_track, publication) => {
+        document.getElementById(publication.trackSid)?.remove();
+        document.getElementById(`${publication.trackSid}-audio`)?.remove();
+        refreshSound();
+        layout();
+      });
+      room.on(LivekitClient.RoomEvent.AudioPlaybackStatusChanged, refreshSound);
+      // LiveKit itself rides out short network drops; after a real disconnect
+      // (e.g. a Wi-Fi outage at the venue) this page joins again on its own.
+      room.on(LivekitClient.RoomEvent.Disconnected, reason => {
+        grid.replaceChildren();
+        document.querySelectorAll('audio').forEach(element => element.remove());
+        layout();
+        window.teleopRoom = null;
+        refreshSound();
+        // Same link opened on another screen: rejoining would kick that one out,
+        // and the two would take turns forever. Stay out instead.
+        if (reason === LivekitClient.DisconnectReason.DUPLICATE_IDENTITY) {
+          status.textContent = 'Disconnected: this link was opened on another screen. Reload to take over.';
+          return;
+        }
+        // Removed on purpose (server API): LiveKit also revokes the token.
+        if (reason === LivekitClient.DisconnectReason.PARTICIPANT_REMOVED) {
+          status.textContent = 'Disconnected: this link was switched off.';
+          return;
+        }
+        retry('Disconnected');
+      });
+      await room.connect(url, token, { autoSubscribe: true });
+      status.textContent = `Connected to ${room.name}`;
+      window.teleopRoom = room;
+      retryDelay = 2;
+      refreshSound();
+    }
+
+    let retryDelay = 2;
+    let retryTimer = null;
+    function retry(reason) {
+      status.textContent = `${reason} -- retrying in ${retryDelay} s`;
+      if (retryTimer) return;   // one pending retry, even if several events fire
+      retryTimer = setTimeout(() => { retryTimer = null; start(); }, retryDelay * 1000);
+      retryDelay = Math.min(retryDelay * 2, 30);
+    }
+    function start() {
+      if (!url || !token) { status.textContent = 'Viewer URL or token is missing.'; return; }
+      status.textContent = 'Connecting…';
+      connect().catch(error => {
+        // Expired or revoked token: retrying cannot help, a new link is needed.
+        if (error.reason === LivekitClient.ConnectionErrorReason.NotAllowed || error.status === 401) {
+          status.textContent = 'This link has expired or was switched off -- ask for a new link.';
+          return;
+        }
+        retry(`Connection failed: ${error.message}`);
+      });
+    }
+    start();
+  </script>
+</body>
+</html>
