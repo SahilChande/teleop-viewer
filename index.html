@@ -49,7 +49,8 @@
 
     // links/<first 32 hex of sha256(code)>.json next to this page holds
     // {salt, iv, iterations, data}: AES-GCM (key = PBKDF2-SHA256 of the code) of
-    // {url, token}. The code never leaves the browser; without it the public
+    // {url, token} or, for a viewer pool, {url, tokens: [...]} (one LiveKit
+    // identity each). The code never leaves the browser; without it the public
     // file is useless. Written by davegi_teleop_demo ./viewer_link.sh.
     async function resolveShortLink(code) {
       const encoder = new TextEncoder();
@@ -166,6 +167,19 @@
         refreshSound();
         // Same link opened on another screen: rejoining would kick that one out,
         // and the two would take turns forever. Stay out instead.
+        // Pool link: another viewer took this identity -- move to another one.
+        // Pool link: a newcomer took this seat (identity). Move to a seat this
+        // page saw free while connected; if none is free, stop instead of
+        // bumping the next viewer (no chain of blackouts).
+        if (reason === LivekitClient.DisconnectReason.DUPLICATE_IDENTITY && pool) {
+          if (!pickFromPool()) {
+            status.textContent = `All ${pool.length} seats are taken -- reload to try again.`;
+            return;
+          }
+          status.textContent = 'Seat taken by another viewer -- switching';
+          setTimeout(start, 300 + Math.random() * 1200);   // jitter: no lockstep with the other viewer
+          return;
+        }
         if (reason === LivekitClient.DisconnectReason.DUPLICATE_IDENTITY) {
           status.textContent = 'Disconnected: this link was opened on another screen. Reload to take over.';
           return;
@@ -177,7 +191,12 @@
         }
         retry('Disconnected');
       });
+      // Seats in use = identities of the other participants in the room.
+      room.on(LivekitClient.RoomEvent.ParticipantConnected, participant => occupied.add(participant.identity));
+      room.on(LivekitClient.RoomEvent.ParticipantDisconnected, participant => occupied.delete(participant.identity));
       await room.connect(url, token, { autoSubscribe: true });
+      occupied.clear();
+      room.remoteParticipants.forEach(participant => occupied.add(participant.identity));
       status.textContent = `Connected to ${room.name}`;
       window.teleopRoom = room;
       retryDelay = 2;
@@ -204,10 +223,28 @@
         retry(`Connection failed: ${error.message}`);
       });
     }
+    // Pool: each page takes a random identity (token) from the pool, a
+    // different one each time it has to switch.
+    let pool = null;
+    const occupied = new Set();
+    const identityOf = jwt => {
+      const part = jwt.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+      return JSON.parse(atob(part + '='.repeat((4 - part.length % 4) % 4))).sub;
+    };
+    // Random seat that is neither ours nor seen in use; false when none is left.
+    function pickFromPool() {
+      const free = pool.filter(candidate => candidate !== token && !occupied.has(identityOf(candidate)));
+      if (!free.length) return false;
+      token = free[Math.floor(Math.random() * free.length)];
+      return true;
+    }
+
     async function begin() {
       if (shortCode) {
         try {
-          ({ url, token } = await resolveShortLink(shortCode));
+          const link = await resolveShortLink(shortCode);
+          url = link.url;
+          if (Array.isArray(link.tokens)) { pool = link.tokens; pickFromPool(); } else { token = link.token; }
         } catch (error) {
           // Network trouble (fetch -> TypeError): try again; anything else is final.
           if (error instanceof TypeError) {
